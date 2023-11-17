@@ -26,12 +26,16 @@
 #include <message_filters/subscriber.h>
 #include <message_filters/time_synchronizer.h>
 #include <message_filters/sync_policies/approximate_time.h>
+#include <nav_msgs/Odometry.h>
+#include <tf/transform_broadcaster.h>
 
 #include <opencv2/core/core.hpp>
 
 #include "../../../include/System.h"
 
 using namespace std;
+
+ORB_SLAM3::Frame frame = {};
 
 class ImageGrabber
 {
@@ -48,6 +52,8 @@ public:
 int main(int argc, char **argv)
 {
     ros::init(argc, argv, "RGBD");
+    // ros::NodeHandle n("orb_slam3");
+
     ros::start();
 
     if (argc != 5)
@@ -71,46 +77,7 @@ int main(int argc, char **argv)
     stringstream ss(argv[3]);
     ss >> boolalpha >> igb.do_rectify;
 
-    if (igb.do_rectify)
-    {
-        // Load settings related to stereo calibration
-        cv::FileStorage fsSettings(argv[2], cv::FileStorage::READ);
-        if (!fsSettings.isOpened())
-        {
-            cerr << "ERROR: Wrong path to settings" << endl;
-            return -1;
-        }
-
-        cv::Mat K_l, K_r, P_l, P_r, R_l, R_r, D_l, D_r;
-        fsSettings["LEFT.K"] >> K_l;
-        fsSettings["RIGHT.K"] >> K_r;
-
-        fsSettings["LEFT.P"] >> P_l;
-        fsSettings["RIGHT.P"] >> P_r;
-
-        fsSettings["LEFT.R"] >> R_l;
-        fsSettings["RIGHT.R"] >> R_r;
-
-        fsSettings["LEFT.D"] >> D_l;
-        fsSettings["RIGHT.D"] >> D_r;
-
-        int rows_l = fsSettings["LEFT.height"];
-        int cols_l = fsSettings["LEFT.width"];
-        int rows_r = fsSettings["RIGHT.height"];
-        int cols_r = fsSettings["RIGHT.width"];
-
-        if (K_l.empty() || K_r.empty() || P_l.empty() || P_r.empty() || R_l.empty() || R_r.empty() || D_l.empty() || D_r.empty() ||
-            rows_l == 0 || rows_r == 0 || cols_l == 0 || cols_r == 0)
-        {
-            cerr << "ERROR: Calibration parameters to rectify stereo are missing!" << endl;
-            return -1;
-        }
-
-        cv::initUndistortRectifyMap(K_l, D_l, R_l, P_l.rowRange(0, 3).colRange(0, 3), cv::Size(cols_l, rows_l), CV_32F, igb.M1l, igb.M2l);
-        cv::initUndistortRectifyMap(K_r, D_r, R_r, P_r.rowRange(0, 3).colRange(0, 3), cv::Size(cols_r, rows_r), CV_32F, igb.M1r, igb.M2r);
-    }
-
-    ros::NodeHandle nh;
+    ros::NodeHandle nh("orb_slam3");
 
     message_filters::Subscriber<sensor_msgs::Image> left_sub(nh, "/camera/left/image_raw", 1);
     message_filters::Subscriber<sensor_msgs::Image> right_sub(nh, "/camera/right/image_raw", 1);
@@ -118,7 +85,89 @@ int main(int argc, char **argv)
     message_filters::Synchronizer<sync_pol> sync(sync_pol(10), left_sub, right_sub);
     sync.registerCallback(boost::bind(&ImageGrabber::GrabStereo, &igb, _1, _2));
 
-    ros::spin();
+    // ros::spin();
+
+    Eigen::Matrix3f rotm;
+    rotm << 0, 1, 0, -1, 0, 0, 0, 0, 1;
+    const Eigen::Quaternionf rotq(rotm);
+
+    tf::TransformBroadcaster odom_broadcaster;
+
+    ros::Time current_time, last_time;
+    current_time = ros::Time::now();
+    last_time = ros::Time::now();
+    Sophus::SE3f prevTcw;
+
+    ros::Publisher odom_pub = n.advertise<nav_msgs::Odometry>("odom", 100);
+
+    ros::Rate loop_rate(200);
+
+    while (nh.ok())
+    {
+        ros::spinOnce(); // check for incoming messages
+        current_time = ros::Time::now();
+
+        const Sophus::SE3f Tcw = frame.GetPose().inverse();
+
+        // first, we'll publish the transform over tf
+        geometry_msgs::TransformStamped odom_trans;
+        odom_trans.header.stamp = current_time;
+        odom_trans.header.frame_id = "odom";
+        odom_trans.child_frame_id = "base_link";
+
+        odom_trans.transform.translation.x = Tcw.translation()[1];
+        odom_trans.transform.translation.y = -Tcw.translation()[0];
+        odom_trans.transform.translation.z = Tcw.translation()[2];
+        const Eigen::Quaternionf rotted = rotq * Tcw.so3().unit_quaternion();
+        odom_trans.transform.rotation.x = rotted.x();
+        odom_trans.transform.rotation.y = rotted.y();
+        odom_trans.transform.rotation.z = rotted.z();
+        odom_trans.transform.rotation.w = rotted.w();
+
+        // send the transform
+        odom_broadcaster.sendTransform(odom_trans);
+
+        /**
+         * This is a message object. You stuff it with data, and then publish it.
+         */
+
+        odom.header.stamp = current_time;
+        odom.header.frame_id = "odom";
+        odom.child_frame_id = "base_link";
+
+        odom.pose.pose.position.x = Tcw.translation()[1];
+        odom.pose.pose.position.y = -Tcw.translation()[0];
+        odom.pose.pose.position.z = Tcw.translation()[2];
+
+        odom.pose.pose.orientation.x = rotted.x();
+        odom.pose.pose.orientation.y = rotted.y();
+        odom.pose.pose.orientation.z = rotted.z();
+        odom.pose.pose.orientation.w = rotted.w();
+
+        double dt = (current_time - last_time).toSec();
+        const Sophus::SE3f diff = Tcw * prevTcw;
+
+        // odom.twist.twist.linear.x = diff.translation()[1]/dt;
+        // odom.twist.twist.linear.y = -diff.translation()[0]/dt;
+        // odom.twist.twist.linear.z = diff.translation()[2]/dt;
+        odom.twist.twist.linear.x = frame.GetVelocity()[1];
+        odom.twist.twist.linear.y = -frame.GetVelocity()[0];
+        odom.twist.twist.linear.z = frame.GetVelocity()[2];
+
+        prevTcw = frame.GetPose();
+
+        last_time = current_time;
+
+        /**
+         * The publish() function is how you send messages. The parameter
+         * is the message object. The type of this object must agree with the type
+         * given as a template parameter to the advertise<>() call, as was done
+         * in the constructor above.
+         */
+        odom_pub.publish(odom);
+
+        loop_rate.sleep();
+    }
 
     // Stop all threads
     SLAM.Shutdown();
@@ -163,10 +212,10 @@ void ImageGrabber::GrabStereo(const sensor_msgs::ImageConstPtr &msgLeft, const s
         cv::Mat imLeft, imRight;
         cv::remap(cv_ptrLeft->image, imLeft, M1l, M2l, cv::INTER_LINEAR);
         cv::remap(cv_ptrRight->image, imRight, M1r, M2r, cv::INTER_LINEAR);
-        mpSLAM->TrackStereo(imLeft, imRight, cv_ptrLeft->header.stamp.toSec());
+        frame = mpSLAM->TrackStereo(imLeft, imRight, cv_ptrLeft->header.stamp.toSec());
     }
     else
     {
-        mpSLAM->TrackStereo(cv_ptrLeft->image, cv_ptrRight->image, cv_ptrLeft->header.stamp.toSec());
+        frame = mpSLAM->TrackStereo(cv_ptrLeft->image, cv_ptrRight->image, cv_ptrLeft->header.stamp.toSec());
     }
 }
