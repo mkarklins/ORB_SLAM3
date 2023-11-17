@@ -36,6 +36,7 @@
 using namespace std;
 
 ORB_SLAM3::Frame frame = {};
+nav_msgs::Odometry odom;
 
 class ImageGrabber
 {
@@ -98,7 +99,7 @@ int main(int argc, char **argv)
     last_time = ros::Time::now();
     Sophus::SE3f prevTcw;
 
-    ros::Publisher odom_pub = n.advertise<nav_msgs::Odometry>("odom", 100);
+    ros::Publisher odom_pub = nh.advertise<nav_msgs::Odometry>("odom", 100);
 
     ros::Rate loop_rate(200);
 
